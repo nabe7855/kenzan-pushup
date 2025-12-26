@@ -1,0 +1,411 @@
+import { DailyLog, PushUpSet, TargetItem, UserProfile } from "@/types/types";
+import { supabase } from "./supabase";
+
+/**
+ * Executes a promise with a timeout.
+ */
+async function withTimeout<T>(
+  label: string,
+  promise: Promise<T> | { then: (onfulfilled: (value: T) => void) => any },
+  ms: number = 10000
+): Promise<T> {
+  let timeoutId: any;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(new Error(`[Storage] Timeout: ${label} after ${ms}ms`));
+    }, ms);
+  });
+
+  const startTime = Date.now();
+  try {
+    const result = await Promise.race([
+      Promise.resolve(promise as Promise<T>),
+      timeoutPromise,
+    ]);
+    const duration = Date.now() - startTime;
+    console.log(`[Storage] Query Success: ${label} (${duration}ms)`);
+    clearTimeout(timeoutId);
+    return result;
+  } catch (error) {
+    const duration = Date.now() - startTime;
+    console.warn(
+      `[Storage] Query Failed/Timeout: ${label} (${duration}ms)`,
+      error
+    );
+    clearTimeout(timeoutId);
+    throw error;
+  }
+}
+
+export const saveUser = async (user: UserProfile) => {
+  const { error } = await supabase
+    .from("profiles")
+    .update({
+      name: user.name,
+      avatar_url: user.avatarUrl,
+      level: user.level,
+      xp: user.xp,
+      total_pushups: user.totalPushUps,
+      current_streak: user.currentStreak,
+      best_streak: user.bestStreak,
+      last_active_date: user.lastActiveDate,
+      daily_target: user.dailyTarget,
+      daily_target_sets: user.dailyTargetSets,
+      completion_window_hours: user.completionWindowHours,
+      last_set_timestamp: user.lastSetTimestamp
+        ? new Date(user.lastSetTimestamp).toISOString()
+        : null,
+    })
+    .eq("id", user.id);
+
+  if (error) throw error;
+};
+
+export const createProfile = async (
+  id: string,
+  email: string,
+  name?: string
+): Promise<UserProfile> => {
+  console.log(`[Storage] createProfile for id: ${id}`);
+  const newProfile = {
+    id,
+    email,
+    name: name || email.split("@")[0],
+    level: 1,
+    xp: 0,
+    total_pushups: 0,
+    current_streak: 0,
+    best_streak: 0,
+    daily_target: 50,
+    daily_target_sets: 5,
+    completion_window_hours: 2,
+    avatar_url: null,
+    last_active_date: null,
+    last_set_timestamp: null,
+  };
+
+  const { error } = await withTimeout(
+    "createProfile",
+    supabase.from("profiles").insert(newProfile),
+    30000 // プロフィール作成は少し長めに許可
+  );
+  if (error) {
+    console.error("[Storage] createProfile ERROR:", error);
+    throw error;
+  }
+
+  return {
+    id: newProfile.id,
+    name: newProfile.name,
+    avatarUrl: newProfile.avatar_url,
+    level: newProfile.level,
+    xp: newProfile.xp,
+    totalPushUps: newProfile.total_pushups,
+    currentStreak: newProfile.current_streak,
+    bestStreak: newProfile.best_streak,
+    lastActiveDate: newProfile.last_active_date,
+    dailyTarget: newProfile.daily_target,
+    dailyTargetSets: newProfile.daily_target_sets,
+    completionWindowHours: newProfile.completion_window_hours,
+    lastSetTimestamp: null,
+    targetBreakdown: [],
+    email: newProfile.email,
+  };
+};
+
+export const loadUser = async (
+  id: string,
+  retryCount = 0
+): Promise<UserProfile | null> => {
+  const MAX_RETRIES = 3;
+  const TIMEOUT_MS = 15000; // 30秒は長いので15秒に。
+
+  console.log(
+    `[Storage] loadUser START for id: ${id} (Attempt: ${
+      retryCount + 1
+    }/${MAX_RETRIES})`
+  );
+
+  try {
+    // 1. プロフィール取得
+    console.log("[Storage] loadUser: Fetching profile...");
+    const { data: profileData, error: profileError } = await withTimeout(
+      "loadUser:profiles",
+      supabase.from("profiles").select("*").eq("id", id).maybeSingle(),
+      TIMEOUT_MS
+    );
+
+    if (profileError) {
+      throw profileError; // catchブロックでリトライ判定を行う
+    }
+
+    if (!profileData) {
+      console.warn("[Storage] loadUser: Profile NOT FOUND.");
+      return null;
+    }
+
+    console.log("[Storage] loadUser: Profile fetched successfully");
+
+    // 2. 内訳取得
+    console.log("[Storage] loadUser: Fetching breakdown...");
+    const { data: breakdownData, error: breakdownError } = await withTimeout(
+      "loadUser:breakdown",
+      supabase
+        .from("target_breakdown")
+        .select("*")
+        .eq("user_id", id)
+        .order("sort_order", { ascending: true }),
+      TIMEOUT_MS
+    );
+
+    if (breakdownError) {
+      console.warn("[Storage] loadUser (breakdown) ERROR:", breakdownError);
+      // breakdown は失敗しても続行可能とする
+    }
+
+    return {
+      id: profileData.id,
+      name: profileData.name || "Unknown",
+      avatarUrl: profileData.avatar_url,
+      level: profileData.level || 1,
+      xp: profileData.xp || 0,
+      totalPushUps: profileData.total_pushups || 0,
+      currentStreak: profileData.current_streak || 0,
+      bestStreak: profileData.best_streak || 0,
+      lastActiveDate: profileData.last_active_date,
+      dailyTarget: profileData.daily_target || 50,
+      dailyTargetSets: profileData.daily_target_sets || 5,
+      completionWindowHours: profileData.completion_window_hours || 2,
+      lastSetTimestamp: profileData.last_set_timestamp
+        ? new Date(profileData.last_set_timestamp).getTime()
+        : null,
+      targetBreakdown:
+        (breakdownData as any[])
+          ?.filter((tb): tb is any => !!tb)
+          .map((tb) => ({
+            id: tb.id,
+            level: tb.level || 1,
+            variationName: tb.variation_name || "通常",
+            count: tb.reps || 0,
+          })) || [],
+      email: profileData.email || "",
+    };
+  } catch (e: any) {
+    console.warn(
+      `[Storage] loadUser Attempt ${retryCount + 1} FAILED:`,
+      e.message || e
+    );
+
+    if (retryCount < MAX_RETRIES - 1) {
+      const delay = Math.pow(2, retryCount) * 1000; // 指数バックオフ
+      console.log(`[Storage] Retrying loadUser in ${delay}ms...`);
+      await new Promise((res) => setTimeout(res, delay));
+      return loadUser(id, retryCount + 1);
+    }
+
+    console.error("[Storage] loadUser MAX RETRIES reached. Giving up.");
+    throw e; // 最大リトライ回数に達したらエラーを投げる
+  }
+};
+
+export const loadLogs = async (
+  userId: string,
+  retryCount = 0
+): Promise<DailyLog[]> => {
+  const MAX_RETRIES = 3;
+  const TIMEOUT_MS = 15000;
+
+  console.log(
+    `[Storage] loadLogs START for userId: ${userId} (Attempt: ${
+      retryCount + 1
+    }/${MAX_RETRIES})`
+  );
+
+  try {
+    console.log("[Storage] loadLogs: Fetching daily_logs...");
+    const { data: logsData, error: logsError } = await withTimeout(
+      "loadLogs:daily_logs",
+      supabase
+        .from("daily_logs")
+        .select("*")
+        .eq("user_id", userId)
+        .order("date", { ascending: false }),
+      TIMEOUT_MS
+    );
+
+    if (logsError) throw logsError;
+
+    console.log("[Storage] loadLogs: daily_logs fetched successfully", {
+      count: logsData?.length,
+    });
+
+    console.log("[Storage] loadLogs: Fetching workouts...");
+    const { data: workoutsData, error: workoutsError } = await withTimeout(
+      "loadLogs:workouts",
+      supabase
+        .from("workouts")
+        .select("*")
+        .eq("user_id", userId)
+        .order("timestamp", { ascending: false }),
+      TIMEOUT_MS
+    );
+
+    if (workoutsError) throw workoutsError;
+
+    console.log("[Storage] loadLogs: workouts fetched successfully", {
+      count: workoutsData?.length,
+    });
+
+    return (logsData as any[]).map((log) => ({
+      date: log.date,
+      target: log.target,
+      totalCount: log.total_count,
+      achieved: log.achieved,
+      targetSets: log.target_sets,
+      completedSetsCount: log.completed_sets_count,
+      sets: (workoutsData || [])
+        .filter((w: any) => w.timestamp && w.timestamp.startsWith(log.date))
+        .map((w: any) => ({
+          id: w.id,
+          count: w.count,
+          timestamp: w.timestamp ? new Date(w.timestamp).getTime() : Date.now(),
+          variationName: w.variation_name,
+        })),
+    }));
+  } catch (e: any) {
+    console.warn(
+      `[Storage] loadLogs Attempt ${retryCount + 1} FAILED:`,
+      e.message || e
+    );
+
+    if (retryCount < MAX_RETRIES - 1) {
+      const delay = Math.pow(2, retryCount) * 1000;
+      console.log(`[Storage] Retrying loadLogs in ${delay}ms...`);
+      await new Promise((res) => setTimeout(res, delay));
+      return loadLogs(userId, retryCount + 1);
+    }
+
+    console.error("[Storage] loadLogs MAX RETRIES reached. Giving up.");
+    throw e;
+  }
+};
+
+export const insertWorkout = async (userId: string, set: PushUpSet) => {
+  const { error } = await supabase.from("workouts").insert({
+    user_id: userId,
+    count: set.count,
+    variation_name: set.variationName,
+    timestamp: new Date(set.timestamp).toISOString(),
+  });
+
+  if (error) throw error;
+};
+
+export const upsertDailyLog = async (userId: string, log: DailyLog) => {
+  const { error } = await supabase.from("daily_logs").upsert(
+    {
+      user_id: userId,
+      date: log.date,
+      target: log.target,
+      total_count: log.totalCount,
+      achieved: log.achieved,
+      target_sets: log.targetSets,
+      completed_sets_count: log.completedSetsCount,
+      updated_at: new Date().toISOString(),
+    },
+    { onConflict: "user_id,date" }
+  );
+
+  if (error) throw error;
+};
+
+export const updateTargetBreakdown = async (
+  userId: string,
+  items: TargetItem[]
+) => {
+  // 1. 既存の設定を削除
+  const { error: deleteError } = await supabase
+    .from("target_breakdown")
+    .delete()
+    .eq("user_id", userId);
+
+  if (deleteError) throw deleteError;
+
+  // 2. 新しい設定を挿入
+  if (items.length > 0) {
+    const { error: insertError } = await supabase
+      .from("target_breakdown")
+      .insert(
+        items.map((item, index) => ({
+          user_id: userId,
+          variation_name: item.variationName,
+          reps: item.count,
+          level: item.level,
+          sort_order: index,
+        }))
+      );
+
+    if (insertError) throw insertError;
+  }
+};
+
+export const getTodayStr = () => new Date().toISOString().split("T")[0];
+
+export const getOrCreateTodayLog = (
+  logs: DailyLog[],
+  user: UserProfile
+): { logs: DailyLog[]; todayLog: DailyLog } => {
+  const today = getTodayStr();
+  const existingIndex = logs.findIndex((l) => l.date === today);
+
+  if (existingIndex !== -1) {
+    return { logs, todayLog: logs[existingIndex] };
+  }
+
+  const newLog: DailyLog = {
+    date: today,
+    sets: [],
+    target: user.dailyTarget,
+    totalCount: 0,
+    achieved: false,
+    targetSets: user.dailyTargetSets,
+    completedSetsCount: 0,
+  };
+
+  return { logs: [newLog, ...logs], todayLog: newLog };
+};
+
+export const exportToCSV = (logs: DailyLog[]) => {
+  const header = [
+    "Date",
+    "Total Count",
+    "Target",
+    "Achieved",
+    "Sets Details",
+  ].join(",");
+  const rows = logs.map((log) => {
+    const setsDetails = log.sets.map((s) => `${s.count}`).join("|");
+    return [
+      log.date,
+      log.totalCount,
+      log.target,
+      log.achieved ? "Yes" : "No",
+      `"${setsDetails}"`,
+    ].join(",");
+  });
+
+  return [header, ...rows].join("\n");
+};
+
+export const downloadCSV = (logs: DailyLog[]) => {
+  const csvContent = exportToCSV(logs);
+  const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.setAttribute("href", url);
+  link.setAttribute("download", `pushup_senkai_data_${getTodayStr()}.csv`);
+  link.style.visibility = "hidden";
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+};
