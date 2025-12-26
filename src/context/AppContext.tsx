@@ -56,93 +56,109 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({
   const [isLoggedIn, setIsLoggedIn] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [session, setSession] = useState<any>(null); // Supabase セッション保持用
+  const [isFirstLoad, setIsFirstLoad] = useState(true);
 
   // 最後に正常に読み込んだユーザーIDを保持（重複イベント回避用）
   const lastHandledUserId = React.useRef<string | null>(null);
+  // 実行中の Fetch を中断するためのコントローラー
+  const abortControllerRef = React.useRef<AbortController | null>(null);
 
   // Supabase Auth 状態の監視
   useEffect(() => {
     console.log("[AppContext] useEffect [Auth] started");
     let mounted = true;
-    let currentEventId = 0; // 同時実行を防ぐためのカウンター
-
-    // 45秒後に強制的に読み込み状態を解除するセーフティタイマー（コールドスタート考慮）
-    const timeoutId = setTimeout(() => {
-      if (mounted && isLoading) {
-        console.warn(
-          "[AppContext] Auth initialization TIMED OUT after 45s. Forcing isLoading to false."
-        );
-        setIsLoading(false);
-      }
-    }, 45000);
 
     console.log("[AppContext] Subscribing to onAuthStateChange...");
     const {
       data: { subscription },
     } = supabase.auth.onAuthStateChange(async (event, session) => {
-      const eventId = ++currentEventId;
-      const userId = session?.user?.id || null;
-
-      console.log(`[AppContext] Auth State Changed (${eventId}): ${event}`, {
+      console.log(`[AppContext] Auth State Changed: ${event}`, {
         hasSession: !!session,
-        userId,
+        userId: session?.user?.id,
       });
+      setSession(session);
 
-      // 1. セッションがない場合：ステートリセットして終了
-      if (!session?.user) {
-        if (mounted && currentEventId === eventId) {
-          setIsLoading(false);
-          setIsLoggedIn(false);
-          setUser(null);
-          setLogs([]);
-          lastHandledUserId.current = null;
-        }
-        return;
-      }
-
-      // 2. セッションがある場合：既存ユーザーとの重複チェック
-      if (
-        userId &&
-        userId === lastHandledUserId.current &&
-        isLoggedIn &&
-        user &&
-        !error
-      ) {
-        console.log(
-          `[AppContext] (${eventId}) Redundant session event for ${userId}. Skipping fetch.`
-        );
+      // セッションが消失した場合は即座にステートをクリア
+      if (!session) {
+        setIsLoggedIn(false);
+        setUser(null);
+        setLogs([]);
+        lastHandledUserId.current = null;
         setIsLoading(false);
-        return;
       }
+    });
 
-      // 3. データ取得開始
+    return () => {
+      console.log("[AppContext] useEffect [Auth] CLEANUP");
+      mounted = false;
+      subscription.unsubscribe();
+    };
+  }, []);
+
+  // データ取得用の Effect
+  useEffect(() => {
+    let mounted = true;
+    const userId = session?.user?.id;
+
+    if (!userId) {
+      // セッションがない場合は、isLoadingをfalseに設定し、データ取得をスキップ
+      if (mounted) setIsLoading(false);
+      return;
+    }
+
+    // 1. 重複チェック
+    if (userId === lastHandledUserId.current && isLoggedIn && user && !error) {
+      console.log(
+        `[AppContext] Redundant session for ${userId}. Skipping fetch.`
+      );
+      setIsLoading(false);
+      return;
+    }
+
+    const runFetch = async () => {
+      // 進行中のリクエストがあれば中断
+      if (abortControllerRef.current) {
+        console.log(`[AppContext] Aborting previous fetch process...`);
+        abortControllerRef.current.abort();
+      }
+      const controller = new AbortController();
+      abortControllerRef.current = controller;
+      const signal = controller.signal;
+
+      const eventId = Math.random().toString(36).substring(7);
+
       try {
-        if (mounted && currentEventId === eventId) {
+        if (mounted) {
           setIsLoading(true);
           setIsLoggedIn(true);
           setError(null);
         }
 
-        // Supabase Client の内部状態（Auth Token）が安定するのを待つ
-        await new Promise((res) => setTimeout(res, 200));
+        // セッション直後の初回のみ、Supabase クライアントの安定を待つ
+        if (isFirstLoad) {
+          console.log(
+            `[AppContext] (${eventId}) Initial warm-up delay (500ms)...`
+          );
+          await new Promise((res) => setTimeout(res, 500));
+          if (mounted) setIsFirstLoad(false);
+        }
 
-        console.log(
-          `[AppContext] (${eventId}) Fetching user and logs for ${session.user.id}...`
-        );
+        if (signal.aborted) return;
 
-        // 並列でユーザーデータとログを読み込み
+        console.log(`[AppContext] (${eventId}) Fetching data for ${userId}...`);
+
         const [userData, logsData] = await Promise.all([
-          loadUser(session.user.id),
-          loadLogs(session.user.id),
+          loadUser(userId, 0, signal),
+          loadLogs(userId, 0, signal),
         ]);
 
-        if (mounted && currentEventId === eventId) {
+        if (mounted && !signal.aborted) {
           if (userData) {
             console.log(`[AppContext] (${eventId}) Data fetched successfully`, {
               hasUser: !!userData,
               logsCount: logsData?.length,
             });
-            // 状態が実際に変わる場合のみ更新
             setUser((prev) =>
               JSON.stringify(prev) !== JSON.stringify(userData)
                 ? userData
@@ -153,52 +169,54 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({
                 ? logsData
                 : prev
             );
-            setError(null);
-            lastHandledUserId.current = session.user.id;
+            lastHandledUserId.current = userId;
           } else {
-            // プロフィールが存在しない場合は新規作成
             console.log(
-              `[AppContext] (${eventId}) Profile not found, creating new profile for ${session.user.id}...`
+              `[AppContext] (${eventId}) Profile not found, creating new profile for ${userId}...`
             );
             const newProfile = await createProfile(
-              session.user.id,
+              userId,
               session.user.email || "",
-              session.user.user_metadata?.name
+              session.user.user_metadata?.name,
+              signal
             );
-            if (mounted && currentEventId === eventId) {
+            if (mounted && !signal.aborted) {
               setUser(newProfile);
               setLogs([]);
-              setError(null);
-              lastHandledUserId.current = session.user.id;
+              lastHandledUserId.current = userId;
             }
           }
+          setError(null);
         }
       } catch (err: any) {
-        console.error(
-          `[AppContext] (${eventId}) Auth state handling CRITICAL error:`,
-          err
-        );
-        if (mounted && currentEventId === eventId) {
-          setError(err.message || "認証処理中にエラーが発生しました。");
+        if (err.message?.includes("Aborted")) {
+          console.log(`[AppContext] (${eventId}) Fetch aborted.`);
+          return;
+        }
+        console.error(`[AppContext] (${eventId}) Fetch error:`, err);
+        if (mounted && !signal.aborted) {
+          setError(err.message || "データ取得中にエラーが発生しました。");
         }
       } finally {
-        if (mounted && currentEventId === eventId) {
-          console.log(
-            `[AppContext] (${eventId}) Setting isLoading to false [FINALLY]`
-          );
+        if (mounted && !signal.aborted) {
           setIsLoading(false);
-          clearTimeout(timeoutId);
+          if (abortControllerRef.current === controller) {
+            abortControllerRef.current = null;
+          }
         }
       }
-    });
+    };
+
+    runFetch();
 
     return () => {
-      console.log("[AppContext] useEffect [Auth] CLEANUP");
+      console.log("[AppContext] useEffect [Data Fetch] CLEANUP");
       mounted = false;
-      subscription.unsubscribe();
-      clearTimeout(timeoutId);
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+      }
     };
-  }, []);
+  }, [session]);
 
   const login = async (
     email: string,

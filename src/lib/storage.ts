@@ -7,17 +7,28 @@ import { supabase } from "./supabase";
 async function withTimeout<T>(
   label: string,
   promise: Promise<T> | { then: (onfulfilled: (value: T) => void) => any },
-  ms: number = 10000
+  ms: number = 10000,
+  signal?: AbortSignal
 ): Promise<T> {
   let timeoutId: any;
   const timeoutPromise = new Promise<never>((_, reject) => {
     timeoutId = setTimeout(() => {
       reject(new Error(`[Storage] Timeout: ${label} after ${ms}ms`));
     }, ms);
+
+    if (signal) {
+      signal.addEventListener("abort", () => {
+        clearTimeout(timeoutId);
+        reject(new Error(`[Storage] Aborted: ${label}`));
+      });
+    }
   });
 
   const startTime = Date.now();
   try {
+    if (signal?.aborted) {
+      throw new Error(`[Storage] Aborted: ${label}`);
+    }
     const result = await Promise.race([
       Promise.resolve(promise as Promise<T>),
       timeoutPromise,
@@ -64,7 +75,8 @@ export const saveUser = async (user: UserProfile) => {
 export const createProfile = async (
   id: string,
   email: string,
-  name?: string
+  name?: string,
+  signal?: AbortSignal
 ): Promise<UserProfile> => {
   console.log(`[Storage] createProfile for id: ${id}`);
   const newProfile = {
@@ -87,7 +99,8 @@ export const createProfile = async (
   const { error } = await withTimeout(
     "createProfile",
     supabase.from("profiles").insert(newProfile),
-    30000 // プロフィール作成は少し長めに許可
+    30000,
+    signal
   );
   if (error) {
     console.error("[Storage] createProfile ERROR:", error);
@@ -115,10 +128,11 @@ export const createProfile = async (
 
 export const loadUser = async (
   id: string,
-  retryCount = 0
+  retryCount = 0,
+  signal?: AbortSignal
 ): Promise<UserProfile | null> => {
-  const MAX_RETRIES = 3;
-  const TIMEOUT_MS = 15000; // 30秒は長いので15秒に。
+  const MAX_RETRIES = 2; // 3回から2回に削減
+  const TIMEOUT_MS = 10000; // 15秒から10秒に削減
 
   console.log(
     `[Storage] loadUser START for id: ${id} (Attempt: ${
@@ -132,7 +146,8 @@ export const loadUser = async (
     const { data: profileData, error: profileError } = await withTimeout(
       "loadUser:profiles",
       supabase.from("profiles").select("*").eq("id", id).maybeSingle(),
-      TIMEOUT_MS
+      TIMEOUT_MS,
+      signal
     );
 
     if (profileError) {
@@ -155,7 +170,8 @@ export const loadUser = async (
         .select("*")
         .eq("user_id", id)
         .order("sort_order", { ascending: true }),
-      TIMEOUT_MS
+      TIMEOUT_MS,
+      signal
     );
 
     if (breakdownError) {
@@ -196,11 +212,11 @@ export const loadUser = async (
       e.message || e
     );
 
-    if (retryCount < MAX_RETRIES - 1) {
+    if (retryCount < MAX_RETRIES - 1 && !signal?.aborted) {
       const delay = Math.pow(2, retryCount) * 1000; // 指数バックオフ
       console.log(`[Storage] Retrying loadUser in ${delay}ms...`);
       await new Promise((res) => setTimeout(res, delay));
-      return loadUser(id, retryCount + 1);
+      return loadUser(id, retryCount + 1, signal);
     }
 
     console.error("[Storage] loadUser MAX RETRIES reached. Giving up.");
@@ -210,10 +226,11 @@ export const loadUser = async (
 
 export const loadLogs = async (
   userId: string,
-  retryCount = 0
+  retryCount = 0,
+  signal?: AbortSignal
 ): Promise<DailyLog[]> => {
-  const MAX_RETRIES = 3;
-  const TIMEOUT_MS = 15000;
+  const MAX_RETRIES = 2;
+  const TIMEOUT_MS = 10000;
 
   console.log(
     `[Storage] loadLogs START for userId: ${userId} (Attempt: ${
@@ -230,7 +247,8 @@ export const loadLogs = async (
         .select("*")
         .eq("user_id", userId)
         .order("date", { ascending: false }),
-      TIMEOUT_MS
+      TIMEOUT_MS,
+      signal
     );
 
     if (logsError) throw logsError;
@@ -247,7 +265,8 @@ export const loadLogs = async (
         .select("*")
         .eq("user_id", userId)
         .order("timestamp", { ascending: false }),
-      TIMEOUT_MS
+      TIMEOUT_MS,
+      signal
     );
 
     if (workoutsError) throw workoutsError;
@@ -278,11 +297,11 @@ export const loadLogs = async (
       e.message || e
     );
 
-    if (retryCount < MAX_RETRIES - 1) {
+    if (retryCount < MAX_RETRIES - 1 && !signal?.aborted) {
       const delay = Math.pow(2, retryCount) * 1000;
       console.log(`[Storage] Retrying loadLogs in ${delay}ms...`);
       await new Promise((res) => setTimeout(res, delay));
-      return loadLogs(userId, retryCount + 1);
+      return loadLogs(userId, retryCount + 1, signal);
     }
 
     console.error("[Storage] loadLogs MAX RETRIES reached. Giving up.");

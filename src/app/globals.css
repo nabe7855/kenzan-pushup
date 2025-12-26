@@ -11,7 +11,7 @@
   --color-background: var(--background);
   --color-foreground: var(--foreground);
   --color-accent: var(--accent);
-  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui;
+  --font-sans: var(--font-geist-sans), Inter, system-ui, sans-serif;
   --font-mono: var(--font-geist-mono), ui-monospace, SFMono-Regular;
 }
 
