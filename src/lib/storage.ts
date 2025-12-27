@@ -1,6 +1,10 @@
 import { DailyLog, PushUpSet, TargetItem, UserProfile } from "@/types/types";
 import { supabase } from "./supabase";
 
+// 同時実行中のリクエストを管理するためのキャッシュ
+const inflightUserLoads = new Map<string, Promise<UserProfile | null>>();
+const inflightLogsLoads = new Map<string, Promise<DailyLog[]>>();
+
 /**
  * Executes a promise with a timeout.
  */
@@ -140,88 +144,108 @@ export const loadUser = async (
     }/${MAX_RETRIES})`
   );
 
-  try {
-    // 1. プロフィール取得
-    console.log("[Storage] loadUser: Fetching profile...");
-    const { data: profileData, error: profileError } = await withTimeout(
-      "loadUser:profiles",
-      supabase.from("profiles").select("*").eq("id", id).maybeSingle(),
-      TIMEOUT_MS,
-      signal
+  // 1回目かつ同じIDのリクエストが進行中なら、そのPromiseを返す
+  if (retryCount === 0 && inflightUserLoads.has(id)) {
+    console.log(
+      `[Storage] loadUser: Returning existing inflight promise for ${id}`
     );
-
-    if (profileError) {
-      throw profileError; // catchブロックでリトライ判定を行う
-    }
-
-    if (!profileData) {
-      console.warn("[Storage] loadUser: Profile NOT FOUND.");
-      return null;
-    }
-
-    console.log("[Storage] loadUser: Profile fetched successfully");
-
-    // 2. 内訳取得
-    console.log("[Storage] loadUser: Fetching breakdown...");
-    const { data: breakdownData, error: breakdownError } = await withTimeout(
-      "loadUser:breakdown",
-      supabase
-        .from("target_breakdown")
-        .select("*")
-        .eq("user_id", id)
-        .order("sort_order", { ascending: true }),
-      TIMEOUT_MS,
-      signal
-    );
-
-    if (breakdownError) {
-      console.warn("[Storage] loadUser (breakdown) ERROR:", breakdownError);
-      // breakdown は失敗しても続行可能とする
-    }
-
-    return {
-      id: profileData.id,
-      name: profileData.name || "Unknown",
-      avatarUrl: profileData.avatar_url,
-      level: profileData.level || 1,
-      xp: profileData.xp || 0,
-      totalPushUps: profileData.total_pushups || 0,
-      currentStreak: profileData.current_streak || 0,
-      bestStreak: profileData.best_streak || 0,
-      lastActiveDate: profileData.last_active_date,
-      dailyTarget: profileData.daily_target || 50,
-      dailyTargetSets: profileData.daily_target_sets || 5,
-      completionWindowHours: profileData.completion_window_hours || 2,
-      lastSetTimestamp: profileData.last_set_timestamp
-        ? new Date(profileData.last_set_timestamp).getTime()
-        : null,
-      targetBreakdown:
-        (breakdownData as any[])
-          ?.filter((tb): tb is any => !!tb)
-          .map((tb) => ({
-            id: tb.id,
-            level: tb.level || 1,
-            variationName: tb.variation_name || "通常",
-            count: tb.reps || 0,
-          })) || [],
-      email: profileData.email || "",
-    };
-  } catch (e: any) {
-    console.warn(
-      `[Storage] loadUser Attempt ${retryCount + 1} FAILED:`,
-      e.message || e
-    );
-
-    if (retryCount < MAX_RETRIES - 1 && !signal?.aborted) {
-      const delay = Math.pow(2, retryCount) * 1000; // 指数バックオフ
-      console.log(`[Storage] Retrying loadUser in ${delay}ms...`);
-      await new Promise((res) => setTimeout(res, delay));
-      return loadUser(id, retryCount + 1, signal);
-    }
-
-    console.error("[Storage] loadUser MAX RETRIES reached. Giving up.");
-    throw e; // 最大リトライ回数に達したらエラーを投げる
+    return inflightUserLoads.get(id)!;
   }
+
+  const fetchPromise = (async (): Promise<UserProfile | null> => {
+    try {
+      // 1. プロフィール取得
+      console.log("[Storage] loadUser: Fetching profile...");
+      const { data: profileData, error: profileError } = await withTimeout(
+        "loadUser:profiles",
+        supabase.from("profiles").select("*").eq("id", id).maybeSingle(),
+        TIMEOUT_MS,
+        signal
+      );
+
+      if (profileError) {
+        throw profileError; // catchブロックでリトライ判定を行う
+      }
+
+      if (!profileData) {
+        console.warn("[Storage] loadUser: Profile NOT FOUND.");
+        return null;
+      }
+
+      console.log("[Storage] loadUser: Profile fetched successfully");
+
+      // 2. 内訳取得
+      console.log("[Storage] loadUser: Fetching breakdown...");
+      const { data: breakdownData, error: breakdownError } = await withTimeout(
+        "loadUser:breakdown",
+        supabase
+          .from("target_breakdown")
+          .select("*")
+          .eq("user_id", id)
+          .order("sort_order", { ascending: true }),
+        TIMEOUT_MS,
+        signal
+      );
+
+      if (breakdownError) {
+        console.warn("[Storage] loadUser (breakdown) ERROR:", breakdownError);
+        // breakdown は失敗しても続行可能とする
+      }
+
+      return {
+        id: profileData.id,
+        name: profileData.name || "Unknown",
+        avatarUrl: profileData.avatar_url,
+        level: profileData.level || 1,
+        xp: profileData.xp || 0,
+        totalPushUps: profileData.total_pushups || 0,
+        currentStreak: profileData.current_streak || 0,
+        bestStreak: profileData.best_streak || 0,
+        lastActiveDate: profileData.last_active_date,
+        dailyTarget: profileData.daily_target || 50,
+        dailyTargetSets: profileData.daily_target_sets || 5,
+        completionWindowHours: profileData.completion_window_hours || 2,
+        lastSetTimestamp: profileData.last_set_timestamp
+          ? new Date(profileData.last_set_timestamp).getTime()
+          : null,
+        targetBreakdown:
+          (breakdownData as any[])
+            ?.filter((tb): tb is any => !!tb)
+            .map((tb) => ({
+              id: tb.id,
+              level: tb.level || 1,
+              variationName: tb.variation_name || "通常",
+              count: tb.reps || 0,
+            })) || [],
+        email: profileData.email || "",
+      };
+    } catch (e: any) {
+      console.warn(
+        `[Storage] loadUser Attempt ${retryCount + 1} FAILED:`,
+        e.message || e
+      );
+
+      if (retryCount < MAX_RETRIES - 1 && !signal?.aborted) {
+        const delay = Math.pow(2, retryCount) * 1000; // 指数バックオフ
+        console.log(`[Storage] Retrying loadUser in ${delay}ms...`);
+        await new Promise((res) => setTimeout(res, delay));
+        return loadUser(id, retryCount + 1, signal);
+      }
+
+      console.error("[Storage] loadUser MAX RETRIES reached. Giving up.");
+      throw e; // 最大リトライ回数に達したらエラーを投げる
+    } finally {
+      if (retryCount === 0) {
+        inflightUserLoads.delete(id);
+      }
+    }
+  })();
+
+  if (retryCount === 0) {
+    inflightUserLoads.set(id, fetchPromise);
+  }
+
+  return fetchPromise;
 };
 
 export const loadLogs = async (
@@ -238,75 +262,100 @@ export const loadLogs = async (
     }/${MAX_RETRIES})`
   );
 
-  try {
-    console.log("[Storage] loadLogs: Fetching daily_logs...");
-    const { data: logsData, error: logsError } = await withTimeout(
-      "loadLogs:daily_logs",
-      supabase
-        .from("daily_logs")
-        .select("*")
-        .eq("user_id", userId)
-        .order("date", { ascending: false }),
-      TIMEOUT_MS,
-      signal
+  if (retryCount === 0 && inflightLogsLoads.has(userId)) {
+    console.log(
+      `[Storage] loadLogs: Returning existing inflight promise for ${userId}`
     );
-
-    if (logsError) throw logsError;
-
-    console.log("[Storage] loadLogs: daily_logs fetched successfully", {
-      count: logsData?.length,
-    });
-
-    console.log("[Storage] loadLogs: Fetching workouts...");
-    const { data: workoutsData, error: workoutsError } = await withTimeout(
-      "loadLogs:workouts",
-      supabase
-        .from("workouts")
-        .select("*")
-        .eq("user_id", userId)
-        .order("timestamp", { ascending: false }),
-      TIMEOUT_MS,
-      signal
-    );
-
-    if (workoutsError) throw workoutsError;
-
-    console.log("[Storage] loadLogs: workouts fetched successfully", {
-      count: workoutsData?.length,
-    });
-
-    return (logsData as any[]).map((log) => ({
-      date: log.date,
-      target: log.target,
-      totalCount: log.total_count,
-      achieved: log.achieved,
-      targetSets: log.target_sets,
-      completedSetsCount: log.completed_sets_count,
-      sets: (workoutsData || [])
-        .filter((w: any) => w.timestamp && w.timestamp.startsWith(log.date))
-        .map((w: any) => ({
-          id: w.id,
-          count: w.count,
-          timestamp: w.timestamp ? new Date(w.timestamp).getTime() : Date.now(),
-          variationName: w.variation_name,
-        })),
-    }));
-  } catch (e: any) {
-    console.warn(
-      `[Storage] loadLogs Attempt ${retryCount + 1} FAILED:`,
-      e.message || e
-    );
-
-    if (retryCount < MAX_RETRIES - 1 && !signal?.aborted) {
-      const delay = Math.pow(2, retryCount) * 1000;
-      console.log(`[Storage] Retrying loadLogs in ${delay}ms...`);
-      await new Promise((res) => setTimeout(res, delay));
-      return loadLogs(userId, retryCount + 1, signal);
-    }
-
-    console.error("[Storage] loadLogs MAX RETRIES reached. Giving up.");
-    throw e;
+    return inflightLogsLoads.get(userId)!;
   }
+
+  const fetchPromise = (async (): Promise<DailyLog[]> => {
+    try {
+      console.log("[Storage] loadLogs: Fetching daily_logs...");
+      const { data: logsData, error: logsError } = await withTimeout(
+        "loadLogs:daily_logs",
+        supabase
+          .from("daily_logs")
+          .select("*")
+          .eq("user_id", userId)
+          .order("date", { ascending: false }),
+        TIMEOUT_MS,
+        signal
+      );
+
+      if (logsError) throw logsError;
+
+      console.log("[Storage] loadLogs: daily_logs fetched successfully", {
+        count: logsData?.length,
+      });
+
+      console.log("[Storage] loadLogs: Fetching workouts...");
+      const { data: workoutsData, error: workoutsError } = await withTimeout(
+        "loadLogs:workouts",
+        supabase
+          .from("workouts")
+          .select("*")
+          .eq("user_id", userId)
+          .order("timestamp", { ascending: false }),
+        TIMEOUT_MS,
+        signal
+      );
+
+      if (workoutsError) throw workoutsError;
+
+      console.log("[Storage] loadLogs: workouts fetched successfully", {
+        count: workoutsData?.length,
+      });
+
+      return (logsData as any[]).map((log) => ({
+        date: log.date,
+        target: log.target,
+        totalCount: log.total_count,
+        achieved: log.achieved,
+        targetSets: log.target_sets,
+        completedSetsCount: log.completed_sets_count,
+        sets: (workoutsData || [])
+          .filter((w: any) => {
+            if (!w.timestamp) return false;
+            // ワークアウトの時刻から「論理的な日付」を算出し、ログの日付と一致するか確認
+            return getLogicalDateStr(w.timestamp) === log.date;
+          })
+          .map((w: any) => ({
+            id: w.id,
+            count: w.count,
+            timestamp: w.timestamp
+              ? new Date(w.timestamp).getTime()
+              : Date.now(),
+            variationName: w.variation_name,
+          })),
+      }));
+    } catch (e: any) {
+      console.warn(
+        `[Storage] loadLogs Attempt ${retryCount + 1} FAILED:`,
+        e.message || e
+      );
+
+      if (retryCount < MAX_RETRIES - 1 && !signal?.aborted) {
+        const delay = Math.pow(2, retryCount) * 1000;
+        console.log(`[Storage] Retrying loadLogs in ${delay}ms...`);
+        await new Promise((res) => setTimeout(res, delay));
+        return loadLogs(userId, retryCount + 1, signal);
+      }
+
+      console.error("[Storage] loadLogs MAX RETRIES reached. Giving up.");
+      throw e;
+    } finally {
+      if (retryCount === 0) {
+        inflightLogsLoads.delete(userId);
+      }
+    }
+  })();
+
+  if (retryCount === 0) {
+    inflightLogsLoads.set(userId, fetchPromise);
+  }
+
+  return fetchPromise;
 };
 
 export const insertWorkout = async (userId: string, set: PushUpSet) => {
@@ -368,7 +417,24 @@ export const updateTargetBreakdown = async (
   }
 };
 
-export const getTodayStr = () => new Date().toISOString().split("T")[0];
+/**
+ * 現在時刻に基づいた「論理的な日付」を返す (朝4時リセット)
+ */
+export const getTodayStr = (date = new Date()) => {
+  const d = new Date(date);
+  // 朝4時未満なら、日付を1日戻す
+  if (d.getHours() < 4) {
+    d.setDate(d.getDate() - 1);
+  }
+  return d.toISOString().split("T")[0];
+};
+
+/**
+ * 任意のタイムスタンプが、どの「論理的な日付」に属するかを判定する
+ */
+export const getLogicalDateStr = (timestamp: number | string) => {
+  return getTodayStr(new Date(timestamp));
+};
 
 export const getOrCreateTodayLog = (
   logs: DailyLog[],
